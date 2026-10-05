@@ -21,15 +21,22 @@ someone else's fraud upstream. The MVP centres on the two hardest, most defensib
 
 ```bash
 npm install
+```
+
+Configure `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in `.env.local` with the credentials
+for your Turso database before running the app. The first request connects to Turso and seeds
+the demo merchant when the statements table is empty.
+
+```bash
 npm run dev        # http://localhost:3000
 npm test           # parser + risk-engine unit tests (node --test)
 npm run typecheck  # tsc --noEmit
 npm run build      # production build
 ```
 
-The first request creates `data/accountfreeze.db` and seeds a demo merchant (Kaveri Home Products),
-~75 days of statement activity, five distinct fraud patterns, two live freeze cases, documents and
-standby credit lines. Delete `data/accountfreeze.db` to re-seed.
+The seeded data includes a demo merchant (Kaveri Home Products), ~75 days of statement activity,
+five distinct fraud patterns, two live freeze cases, documents and standby credit lines. To re-seed,
+clear the demo rows from the Turso database.
 
 ## Scoring rules
 
@@ -67,9 +74,9 @@ against the current circular and portal process before anyone relies on them.**
   characterisation is deferred to an advocate.
 - **No bank integration required.** Everything works off statement uploads, so early value does not
   depend on banks cooperating.
-- **Sensitive data stays local.** SQLite file plus uploaded statements under `data/`; nothing is sent
-  anywhere. Before real customer data goes in, add at-rest encryption, field-level PII handling and
-  audited access.
+- **Sensitive data is stored in Turso.** Uploaded statements and derived records are sent to the
+  configured Turso database. Restrict database access and add field-level PII handling and audited
+  access before real customer data goes in.
 
 ## Layout
 
@@ -80,7 +87,7 @@ src/lib/csv.ts         ingestion: reconcile, score, write, refresh register
 src/lib/cases.ts       escalation ladder builder (deadlines, statuses)
 src/lib/templates.ts   letter templates per stage
 src/lib/evidence.ts    evidence pack + markdown export
-src/lib/db.ts          schema, seed data, queries
+src/lib/db.ts          Turso schema, seed data, async queries
 src/app/               pages, server actions, download routes
 src/app/api/pack       evidence pack (.md / .html)
 src/app/api/letter     individual letters (.txt)

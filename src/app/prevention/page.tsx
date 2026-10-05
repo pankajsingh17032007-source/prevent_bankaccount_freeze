@@ -6,13 +6,15 @@ import { bandClass, inr, fmtDate } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-export default function PreventionPage() {
-  const cps = listCounterparties(60);
-  const credits = listTransactions({ limit: 1000 }).filter((t) => t.credit > 0);
+export default async function PreventionPage() {
+  const [cps, transactions, summary] = await Promise.all([
+    listCounterparties(60), listTransactions({ limit: 1000 }), bandSummary(),
+  ]);
+  const credits = transactions.filter((t) => t.credit > 0);
   const reconciled = credits.filter((t) => t.reconciled === 1);
   const reconciledAmt = reconciled.reduce((s, t) => s + t.credit, 0);
   const totalAmt = credits.reduce((s, t) => s + t.credit, 0);
-  const bands = new Map(bandSummary().map((b) => [b.band, b.n]));
+  const bands = new Map(summary.map((b) => [b.band, b.n]));
   const verified = cps.filter((c) => c.kyc_status === "verified").length;
 
   const controls: Array<[string, string, string]> = [

@@ -5,16 +5,14 @@ import { bandClass, fmtDate, inr, localDate } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-export default function ProfilePage() {
-  const merchant = getMerchant();
-  const cps = listCounterparties(80);
-  const credits = listTransactions({ limit: 2000 }).filter((t) => t.credit > 0);
+export default async function ProfilePage() {
+  const [merchant, cps, transactions, bands, cases, lines, statements, transactionCount] = await Promise.all([
+    getMerchant(), listCounterparties(80), listTransactions({ limit: 2000 }), bandSummary(),
+    listCases(), listCreditLines(), listStatements(), countTransactions(),
+  ]);
+  const credits = transactions.filter((t) => t.credit > 0);
   const totalAmt = credits.reduce((s, t) => s + t.credit, 0);
   const reconciledAmt = credits.filter((t) => t.reconciled === 1).reduce((s, t) => s + t.credit, 0);
-  const bands = bandSummary();
-  const cases = listCases();
-  const lines = listCreditLines();
-  const statements = listStatements();
   const verified = cps.filter((c) => c.kyc_status === "verified").length;
   const watchlisted = cps.filter((c) => c.watchlist === 1).length;
   const months = Math.max(1, Math.round(statements.reduce((s, x) => s + x.txn_count, 0) / 250));
@@ -65,7 +63,7 @@ export default function ProfilePage() {
           </div>
           <div className="stat" style={{ boxShadow: "none" }}>
             <div className="k">Statement coverage</div>
-            <div className="v">{countTransactions()}</div>
+            <div className="v">{transactionCount}</div>
             <div className="d">transactions across {statements.length} statements</div>
           </div>
           <div className="stat" style={{ boxShadow: "none" }}>

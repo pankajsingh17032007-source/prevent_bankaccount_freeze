@@ -12,10 +12,10 @@ const esc = (s: string) =>
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const c = getCase(Number(id));
+  const c = await getCase(Number(id));
   if (!c) return new Response("Case not found", { status: 404 });
 
-  const pack = buildEvidencePack(c);
+  const pack = await buildEvidencePack(c);
   const wantsHtml = new URL(req.url).searchParams.get("format") === "html";
   const filename = `evidence-pack-${c.case_ref}`;
 

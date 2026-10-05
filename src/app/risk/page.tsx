@@ -8,13 +8,13 @@ import { bandClass, bandColor, inr, fmtStamp } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-export default function RiskPage() {
-  const flagged = listTransactions({ band: "CRITICAL", limit: 40 });
-  const high = listTransactions({ band: "HIGH", limit: 40 });
+export default async function RiskPage() {
+  const [flagged, high, cps, summary, total, criticalTotal, highTotal] = await Promise.all([
+    listTransactions({ band: "CRITICAL", limit: 40 }), listTransactions({ band: "HIGH", limit: 40 }),
+    listCounterparties(40), bandSummary(), countTransactions(), creditTotal("CRITICAL"), creditTotal("HIGH"),
+  ]);
   const all = [...flagged, ...high].sort((a, b) => b.risk_score - a.risk_score).slice(0, 30);
-  const cps = listCounterparties(40);
-  const bands = new Map(bandSummary().map((b) => [b.band, b]));
-  const total = countTransactions();
+  const bands = new Map(summary.map((b) => [b.band, b]));
 
   return (
     <div className="stack">
@@ -36,12 +36,12 @@ export default function RiskPage() {
         <div className="stat">
           <div className="k">Critical credits</div>
           <div className="v">{bands.get("CRITICAL")?.n ?? 0}</div>
-          <div className="d">{inr(creditTotal("CRITICAL"))} received</div>
+          <div className="d">{inr(criticalTotal)} received</div>
         </div>
         <div className="stat">
           <div className="k">High credits</div>
           <div className="v">{bands.get("HIGH")?.n ?? 0}</div>
-          <div className="d">{inr(creditTotal("HIGH"))} received</div>
+          <div className="d">{inr(highTotal)} received</div>
         </div>
         <div className="stat">
           <div className="k">Watchlisted payers</div>

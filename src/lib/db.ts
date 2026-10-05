@@ -1,35 +1,21 @@
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
+import type { Client, InArgs, InValue, InStatement, Transaction as LibsqlTransaction } from "@libsql/client";
 
+import { turso } from "./turso";
 import { buildStages } from "./cases";
 import { localDate, localStamp } from "./format";
 import { scoreTransaction } from "./risk";
 import type { Counterparty, CreditLine, FreezeCase, Order, Statement, Transaction } from "./types";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_FILE = path.join(DATA_DIR, "accountfreeze.db");
+let initialization: Promise<void> | undefined;
 
-let _db: Database.Database | null = null;
-
-export function db(): Database.Database {
-  if (_db) return _db;
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  _db = new Database(DB_FILE);
-  _db.pragma("journal_mode = WAL");
-  _db.pragma("foreign_keys = ON");
-  migrate(_db);
-  if (isEmpty(_db)) seed(_db);
-  return _db;
+export async function db(): Promise<Client> {
+  if (!initialization) initialization = initializeDatabase(turso);
+  await initialization;
+  return turso;
 }
 
-function isEmpty(d: Database.Database): boolean {
-  const row = d.prepare("SELECT COUNT(*) AS n FROM statements").get() as { n: number };
-  return row.n === 0;
-}
-
-function migrate(d: Database.Database): void {
-  d.exec(`
+async function initializeDatabase(d: Client): Promise<void> {
+  await d.executeMultiple(`
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -146,6 +132,17 @@ function migrate(d: Database.Database): void {
     status TEXT NOT NULL DEFAULT 'available'
   );
   `);
+  const tx = await d.transaction("write");
+  try {
+    const result = await tx.execute({ sql: "SELECT COUNT(*) AS n FROM statements" });
+    if (Number(result.rows[0]?.n ?? 0) === 0) await seed(tx);
+    await tx.commit();
+  } catch (error) {
+    await tx.rollback();
+    throw error;
+  } finally {
+    tx.close();
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,33 +208,18 @@ export const MERCHANT = {
   sweep_policy: "100% of collection credits swept to operating account at 21:00 IST daily",
 };
 
-function seed(d: Database.Database): void {
+async function seed(d: LibsqlTransaction): Promise<void> {
   const rnd = mulberry32(20261005);
   const today = new Date();
   today.setHours(10, 0, 0, 0);
   const daysBack = 75;
 
-  d.prepare("INSERT INTO settings(key, value) VALUES('merchant', ?)").run(JSON.stringify(MERCHANT));
-
-  const txnStmt = d.prepare(`
-    INSERT INTO transactions
-      (statement_id, posted_at, narration, payer, ref_no, credit, debit, balance, order_id, risk_score, risk_band, risk_reasons, reconciled)
-    VALUES (@statement_id, @posted_at, @narration, @payer, @ref_no, @credit, @debit, @balance, @order_id, @risk_score, @risk_band, @risk_reasons, @reconciled)
-  `);
-  const cpStmt = d.prepare(`
-    INSERT INTO counterparties (name, kind, gstin, kyc_status, first_seen, last_seen, credits_total, credit_count, note, watchlist)
-    VALUES (@name, @kind, @gstin, @kyc_status, @first_seen, @last_seen, @credits_total, @credit_count, @note, @watchlist)
-    ON CONFLICT(name) DO UPDATE SET
-      last_seen = excluded.last_seen,
-      credits_total = excluded.credits_total,
-      credit_count = excluded.credit_count,
-      watchlist = MAX(watchlist, excluded.watchlist),
-      kyc_status = CASE WHEN excluded.watchlist = 1 THEN 'unverified' ELSE counterparties.kyc_status END
-  `);
-  const orderStmt = d.prepare(`
-    INSERT INTO orders (order_no, buyer, amount, placed_at, invoice_no, ship_status, awb, proof_url)
-    VALUES (@order_no, @buyer, @amount, @placed_at, @invoice_no, @ship_status, @awb, @proof_url)
-  `);
+  const seedBatch: InStatement[] = [
+    { sql: "INSERT INTO settings(key, value) VALUES('merchant', ?)", args: [JSON.stringify(MERCHANT)] },
+  ];
+  const orderInserts: InStatement[] = [];
+  const transactionInserts: InStatement[] = [];
+  const counterpartyInserts: InStatement[] = [];
 
   type Row = {
     statement_id: number; posted_at: string; narration: string; payer: string; ref_no: string;
@@ -266,10 +248,11 @@ function seed(d: Database.Database): void {
   };
 
   // statement 1: the whole window
-  const st1 = d
-    .prepare("INSERT INTO statements(filename, bank, account_no, uploaded_at, txn_count) VALUES(?,?,?,?,0)")
-    .run("hdfc-collection-75d.csv", MERCHANT.collection_bank, MERCHANT.collection_account, stamp(new Date(today.getTime() - 864e5)));
-  const statementId = Number(st1.lastInsertRowid);
+  const st1 = await d.execute({
+    sql: "INSERT INTO statements(filename, bank, account_no, uploaded_at, txn_count) VALUES(?,?,?,?,0) RETURNING id",
+    args: ["hdfc-collection-75d.csv", MERCHANT.collection_bank, MERCHANT.collection_account, stamp(new Date(today.getTime() - 864e5))],
+  });
+  const statementId = Number(st1.rows[0]?.id);
 
   let balance = 486000;
   let orderSeq = 4100;
@@ -298,15 +281,14 @@ function seed(d: Database.Database): void {
       orderSeq += 1;
       invoiceSeq += 1;
       const placed = stamp(when);
-      orderStmt.run({
-        order_no: `KH-${orderSeq}`,
-        buyer: name,
-        amount,
-        placed_at: placed,
-        invoice_no: `KHP/26-27/${invoiceSeq}`,
-        ship_status: back > 2 ? "delivered" : rnd() > 0.4 ? "delivered" : "in_transit",
-        awb: `AWB${String(1000000 + Math.floor(rnd() * 8999999))}`,
-        proof_url: back > 2 ? `https://cdn.example.com/pod/KH-${orderSeq}.pdf` : null,
+      orderInserts.push({
+        sql: "INSERT INTO orders (order_no, buyer, amount, placed_at, invoice_no, ship_status, awb, proof_url) VALUES (?,?,?,?,?,?,?,?)",
+        args: [
+          `KH-${orderSeq}`, name, amount, placed, `KHP/26-27/${invoiceSeq}`,
+          back > 2 ? "delivered" : rnd() > 0.4 ? "delivered" : "in_transit",
+          `AWB${String(1000000 + Math.floor(rnd() * 8999999))}`,
+          back > 2 ? `https://cdn.example.com/pod/KH-${orderSeq}.pdf` : null,
+        ],
       });
       push({
         statement_id: statementId,
@@ -518,54 +500,60 @@ function seed(d: Database.Database): void {
     r.risk_band = res.band;
     r.risk_reasons = JSON.stringify(res.reasons);
     knownNames.add(r.payer);
-    txnStmt.run(r as Row & Record<string, unknown>);
-  }
-
-  for (const [name, v] of cpMap) {
-    cpStmt.run({
-      name,
-      kind: "customer",
-      gstin: null,
-      kyc_status: v.kyc,
-      first_seen: v.first,
-      last_seen: v.last,
-      credits_total: Math.round(v.total),
-      credit_count: v.count,
-      note: v.note,
-      watchlist: v.watchlist,
+    transactionInserts.push({
+      sql: `INSERT INTO transactions
+        (statement_id, posted_at, narration, payer, ref_no, credit, debit, balance, order_id, risk_score, risk_band, risk_reasons, reconciled)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [r.statement_id, r.posted_at, r.narration, r.payer, r.ref_no, r.credit, r.debit, r.balance,
+        r.order_id, r.risk_score, r.risk_band, r.risk_reasons, r.reconciled],
     });
   }
 
-  d.prepare("UPDATE statements SET txn_count = (SELECT COUNT(*) FROM transactions WHERE statement_id = statements.id) WHERE id = ?")
-    .run(statementId);
+  for (const [name, v] of cpMap) {
+    counterpartyInserts.push({
+      sql: `INSERT INTO counterparties (name, kind, gstin, kyc_status, first_seen, last_seen, credits_total, credit_count, note, watchlist)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen, credits_total=excluded.credits_total,
+        credit_count=excluded.credit_count, watchlist=MAX(watchlist, excluded.watchlist),
+        kyc_status=CASE WHEN excluded.watchlist=1 THEN 'unverified' ELSE counterparties.kyc_status END`,
+      args: [name, "customer", null, v.kyc, v.first, v.last, Math.round(v.total), v.count, v.note, v.watchlist],
+    });
+  }
 
-  d.prepare("UPDATE counterparties SET kind='supplier', kyc_status='verified', gstin=? WHERE name IN ('SHREE PACKAGING PVT LTD','BLUEDART LOGISTICS','CLOUD HOSTING INDIA')")
-    .run("29AABCS9988K1Z2");
+  await d.batch([...seedBatch, ...orderInserts, ...transactionInserts, ...counterpartyInserts]);
+  await d.execute({
+    sql: "UPDATE statements SET txn_count = (SELECT COUNT(*) FROM transactions WHERE statement_id = statements.id) WHERE id = ?",
+    args: [statementId],
+  });
+  await d.execute({
+    sql: "UPDATE counterparties SET kind='supplier', kyc_status='verified', gstin=? WHERE name IN ('SHREE PACKAGING PVT LTD','BLUEDART LOGISTICS','CLOUD HOSTING INDIA')",
+    args: ["29AABCS9988K1Z2"],
+  });
 
-  seedCases(d, today);
-  seedCreditLines(d);
-  d.prepare("UPDATE transactions SET balance = balance WHERE 1=1").run();
+  await seedCases(d, today);
+  await seedCreditLines(d);
 }
 
-function seedCases(d: Database.Database, today: Date): void {
-  const insertCase = d.prepare(`
+async function seedCases(d: LibsqlTransaction, today: Date): Promise<void> {
+  const insertCase = (args: InArgs) => d.execute({ sql: `
     INSERT INTO cases
       (case_ref, title, account_no, bank, branch, hold_amount, disputed_amount, account_balance,
        hold_scope, trigger_source, ncrp_complaint, fir_no, police_station, freeze_date, status, created_at, notes)
     VALUES (@case_ref, @title, @account_no, @bank, @branch, @hold_amount, @disputed_amount, @account_balance,
        @hold_scope, @trigger_source, @ncrp_complaint, @fir_no, @police_station, @freeze_date, @status, @created_at, @notes)
-  `);
-  const insertStage = d.prepare(`
+    RETURNING id
+  `, args });
+  const insertStage = (args: InArgs) => d.execute({ sql: `
     INSERT INTO case_stages (case_id, step_no, name, authority, sla_days, due_at, status, template_key, actioned_at, log)
     VALUES (@case_id, @step_no, @name, @authority, @sla_days, @due_at, @status, @template_key, @actioned_at, @log)
-  `);
-  const insertDoc = d.prepare(`
+  `, args });
+  const insertDoc = (args: InArgs) => d.execute({ sql: `
     INSERT INTO documents (case_id, doc_type, title, ref, present, note)
     VALUES (@case_id, @doc_type, @title, @ref, @present, @note)
-  `);
+  `, args });
 
   const freezeDate = iso(new Date(today.getTime() - 3 * 864e5));
-  const r1 = insertCase.run({
+  const r1 = await insertCase({
     case_ref: "AF-2026-0142",
     title: "Full-account lien after NCRP complaint on fan-in credits",
     account_no: MERCHANT.collection_account,
@@ -585,10 +573,10 @@ function seedCases(d: Database.Database, today: Date): void {
     notes:
       "Victim transferred ₹19,500 to one of 14 fan-in accounts on 29 Sep. Bank froze the entire collection account on 02 Oct rather than the traceable ₹2,73,000. Operating account (ICICI) is unaffected but sweep has stopped.",
   });
-  const case1 = Number(r1.lastInsertRowid);
+  const case1 = Number(r1.rows[0]?.id);
 
   for (const s of buildStages(new Date(freezeDate).getTime(), "awaiting_bank")) {
-    insertStage.run({ case_id: case1, ...s });
+    await insertStage({ case_id: case1, ...s });
   }
 
   const docs1: Array<[string, string, string, number, string]> = [    ["identity", "Certificate of incorporation", "CIN U36999KA2021PTC148822", 1, "Companies Act filing"],
@@ -604,11 +592,11 @@ function seedCases(d: Database.Database, today: Date): void {
     ["affidavit", "Affidavit on source of funds", "Draft - lawyer review pending", 0, "Not a substitute for legal advice"],
   ];
   for (const [type, title, ref, present, note] of docs1) {
-    insertDoc.run({ case_id: case1, doc_type: type, title, ref, present, note });
+    await insertDoc({ case_id: case1, doc_type: type, title, ref, present, note });
   }
 
   const freezeDate2 = iso(new Date(today.getTime() - 26 * 864e5));
-  const r2 = insertCase.run({
+  const r2 = await insertCase({
     case_ref: "AF-2026-0128",
     title: "Partial hold on RTGS credit from Krishna Enterprises",
     account_no: MERCHANT.collection_account,
@@ -628,9 +616,9 @@ function seedCases(d: Database.Database, today: Date): void {
     notes:
       "Bank held only the disputed amount after we submitted the source-of-funds pack. Release order awaited; remaining amount still earmarked until the beneficiary confirms.",
   });
-  const case2 = Number(r2.lastInsertRowid);
+  const case2 = Number(r2.rows[0]?.id);
   for (const s of buildStages(new Date(freezeDate2).getTime(), "partial_release")) {
-    insertStage.run({ case_id: case2, ...s });
+    await insertStage({ case_id: case2, ...s });
   }
 
   const docs2: Array<[string, string, string, number, string]> = [
@@ -641,11 +629,11 @@ function seedCases(d: Database.Database, today: Date): void {
     ["bank", "Statement with lien entry", "hdfc-collection-75d.csv", 1, ""],
   ];
   for (const [type, title, ref, present, note] of docs2) {
-    insertDoc.run({ case_id: case2, doc_type: type, title, ref, present, note });
+    await insertDoc({ case_id: case2, doc_type: type, title, ref, present, note });
   }
 }
 
-function seedCreditLines(d: Database.Database): void {
+async function seedCreditLines(d: LibsqlTransaction): Promise<void> {
   const rows: Array<Omit<CreditLine, "id">> = [
     {
       provider: "Kaveri's alternate bank (ICICI) - overdraft against FD/GST",
@@ -684,29 +672,34 @@ function seedCreditLines(d: Database.Database): void {
       status: "available",
     },
   ];
-  const stmt = d.prepare(`
-    INSERT INTO credit_lines (provider, kind, limit_amount, rate_pa, eligibility, activation, status)
-    VALUES (@provider, @kind, @limit_amount, @rate_pa, @eligibility, @activation, @status)
-  `);
-  for (const r of rows) stmt.run(r);
+  await d.batch(rows.map((r) => ({
+    sql: `INSERT INTO credit_lines (provider, kind, limit_amount, rate_pa, eligibility, activation, status)
+      VALUES (@provider, @kind, @limit_amount, @rate_pa, @eligibility, @activation, @status)`,
+    args: r,
+  })));
 }
 
 /* ------------------------------------------------------------------ */
 /* queries                                                             */
 /* ------------------------------------------------------------------ */
 
-export function getMerchant(): typeof MERCHANT {
-  const row = db().prepare("SELECT value FROM settings WHERE key='merchant'").get() as { value: string } | undefined;
+async function selectRows<T>(sql: string, args?: InArgs): Promise<T[]> {
+  const result = await (await db()).execute(sql, args);
+  return result.rows as unknown as T[];
+}
+
+export async function getMerchant(): Promise<typeof MERCHANT> {
+  const row = (await selectRows<{ value: string }>("SELECT value FROM settings WHERE key='merchant'"))[0];
   return row ? JSON.parse(row.value) : MERCHANT;
 }
 
-export function listStatements(): Statement[] {
-  return db().prepare("SELECT * FROM statements ORDER BY id DESC").all() as Statement[];
+export async function listStatements(): Promise<Statement[]> {
+  return selectRows<Statement>("SELECT * FROM statements ORDER BY id DESC");
 }
 
-export function listTransactions(opts: { band?: string; limit?: number; offset?: number; q?: string } = {}): Transaction[] {
+export async function listTransactions(opts: { band?: string; limit?: number; offset?: number; q?: string } = {}): Promise<Transaction[]> {
   const where: string[] = [];
-  const params: unknown[] = [];
+  const params: InValue[] = [];
   if (opts.band && opts.band !== "ALL") {
     where.push("risk_band = ?");
     params.push(opts.band);
@@ -718,76 +711,75 @@ export function listTransactions(opts: { band?: string; limit?: number; offset?:
   const sql = `SELECT * FROM transactions ${where.length ? "WHERE " + where.join(" AND ") : ""}
     ORDER BY posted_at DESC LIMIT ? OFFSET ?`;
   params.push(opts.limit ?? 200, opts.offset ?? 0);
-  return db().prepare(sql).all(...params) as Transaction[];
+  return selectRows<Transaction>(sql, params);
 }
 
-export function countTransactions(band?: string): number {
-  const row = band && band !== "ALL"
-    ? (db().prepare("SELECT COUNT(*) n FROM transactions WHERE risk_band=?").get(band) as { n: number })
-    : (db().prepare("SELECT COUNT(*) n FROM transactions").get() as { n: number });
-  return row.n;
+export async function countTransactions(band?: string): Promise<number> {
+  const rows = band && band !== "ALL"
+    ? await selectRows<{ n: number }>("SELECT COUNT(*) n FROM transactions WHERE risk_band=?", [band])
+    : await selectRows<{ n: number }>("SELECT COUNT(*) n FROM transactions");
+  return Number(rows[0]?.n ?? 0);
 }
 
-export function bandSummary(): Array<{ band: string; n: number; amount: number }> {
-  return db()
-    .prepare("SELECT risk_band band, COUNT(*) n, SUM(credit) amount FROM transactions WHERE credit>0 GROUP BY risk_band")
-    .all() as Array<{ band: string; n: number; amount: number }>;
+export async function bandSummary(): Promise<Array<{ band: string; n: number; amount: number }>> {
+  return selectRows("SELECT risk_band band, COUNT(*) n, SUM(credit) amount FROM transactions WHERE credit>0 GROUP BY risk_band");
 }
 
-export function creditTotal(band: string): number {
-  const row = db().prepare("SELECT COALESCE(SUM(credit),0) t FROM transactions WHERE risk_band=?").get(band) as { t: number };
-  return row.t;
+export async function creditTotal(band: string): Promise<number> {
+  const rows = await selectRows<{ t: number }>("SELECT COALESCE(SUM(credit),0) t FROM transactions WHERE risk_band=?", [band]);
+  return Number(rows[0]?.t ?? 0);
 }
 
-export function listCounterparties(limit = 50): Counterparty[] {
-  return db().prepare("SELECT * FROM counterparties ORDER BY credits_total DESC LIMIT ?").all(limit) as Counterparty[];
+export async function listCounterparties(limit = 50): Promise<Counterparty[]> {
+  return selectRows("SELECT * FROM counterparties ORDER BY credits_total DESC LIMIT ?", [limit]);
 }
 
-export function listOrders(limit = 40): Order[] {
-  return db().prepare("SELECT * FROM orders ORDER BY placed_at DESC LIMIT ?").all(limit) as Order[];
+export async function listOrders(limit = 40): Promise<Order[]> {
+  return selectRows("SELECT * FROM orders ORDER BY placed_at DESC LIMIT ?", [limit]);
 }
 
-export function listCases(): FreezeCase[] {
-  return db().prepare("SELECT * FROM cases ORDER BY freeze_date DESC").all() as FreezeCase[];
+export async function listCases(): Promise<FreezeCase[]> {
+  return selectRows("SELECT * FROM cases ORDER BY freeze_date DESC");
 }
 
-export function getCase(id: number): FreezeCase | undefined {
-  return db().prepare("SELECT * FROM cases WHERE id=?").get(id) as FreezeCase | undefined;
+export async function getCase(id: number): Promise<FreezeCase | undefined> {
+  return (await selectRows<FreezeCase>("SELECT * FROM cases WHERE id=?", [id]))[0];
 }
 
-export function listStages(caseId: number) {
-  return db().prepare("SELECT * FROM case_stages WHERE case_id=? ORDER BY step_no").all(caseId) as Array<{
-    id: number; case_id: number; step_no: number; name: string; authority: string; sla_days: number;
-    due_at: string; status: string; template_key: string; actioned_at: string | null; log: string;
-  }>;
+export async function listStages(caseId: number): Promise<Array<{
+  id: number; case_id: number; step_no: number; name: string; authority: string; sla_days: number;
+  due_at: string; status: string; template_key: string; actioned_at: string | null; log: string;
+}>> {
+  return selectRows("SELECT * FROM case_stages WHERE case_id=? ORDER BY step_no", [caseId]);
 }
 
-export function listDocuments(caseId: number) {
-  return db().prepare("SELECT * FROM documents WHERE case_id=? ORDER BY doc_type, id").all(caseId) as Array<{
-    id: number; case_id: number; doc_type: string; title: string; ref: string; present: number; note: string;
-  }>;
+export async function listDocuments(caseId: number): Promise<Array<{
+  id: number; case_id: number; doc_type: string; title: string; ref: string; present: number; note: string;
+}>> {
+  return selectRows("SELECT * FROM documents WHERE case_id=? ORDER BY doc_type, id", [caseId]);
 }
 
-export function listCreditLines(): CreditLine[] {
-  return db().prepare("SELECT * FROM credit_lines ORDER BY id").all() as CreditLine[];
+export async function listCreditLines(): Promise<CreditLine[]> {
+  return selectRows("SELECT * FROM credit_lines ORDER BY id");
 }
 
-export function caseStats() {
-  const open = db().prepare("SELECT COUNT(*) n FROM cases WHERE status NOT IN ('released','closed')").get() as { n: number };
-  const held = db().prepare("SELECT COALESCE(SUM(hold_amount),0) t FROM cases WHERE status NOT IN ('released','closed')").get() as { t: number };
-  const overdues = db().prepare(
-    "SELECT COUNT(*) n FROM case_stages WHERE status IN ('not_started','in_progress','awaiting_response') AND due_at < datetime('now')",
-  ).get() as { n: number };
-  const pendingDocs = db().prepare("SELECT COUNT(*) n FROM documents WHERE present=0").get() as { n: number };
-  return { openCases: open.n, amountHeld: held.t, overdueStages: overdues.n, missingDocs: pendingDocs.n };
+export async function caseStats(): Promise<{ openCases: number; amountHeld: number; overdueStages: number; missingDocs: number }> {
+  const [open, held, overdues, pendingDocs] = await Promise.all([
+    selectRows<{ n: number }>("SELECT COUNT(*) n FROM cases WHERE status NOT IN ('released','closed')"),
+    selectRows<{ t: number }>("SELECT COALESCE(SUM(hold_amount),0) t FROM cases WHERE status NOT IN ('released','closed')"),
+    selectRows<{ n: number }>("SELECT COUNT(*) n FROM case_stages WHERE status IN ('not_started','in_progress','awaiting_response') AND due_at < datetime('now')"),
+    selectRows<{ n: number }>("SELECT COUNT(*) n FROM documents WHERE present=0"),
+  ]);
+  return {
+    openCases: Number(open[0]?.n ?? 0), amountHeld: Number(held[0]?.t ?? 0),
+    overdueStages: Number(overdues[0]?.n ?? 0), missingDocs: Number(pendingDocs[0]?.n ?? 0),
+  };
 }
 
-export function riskFeed(limit = 40): Transaction[] {
-  return db()
-    .prepare("SELECT * FROM transactions WHERE risk_band IN ('HIGH','CRITICAL') ORDER BY posted_at DESC LIMIT ?")
-    .all(limit) as Transaction[];
+export async function riskFeed(limit = 40): Promise<Transaction[]> {
+  return selectRows("SELECT * FROM transactions WHERE risk_band IN ('HIGH','CRITICAL') ORDER BY posted_at DESC LIMIT ?", [limit]);
 }
 
-export function recentTransactions(limit = 25): Transaction[] {
-  return db().prepare("SELECT * FROM transactions ORDER BY posted_at DESC LIMIT ?").all(limit) as Transaction[];
+export async function recentTransactions(limit = 25): Promise<Transaction[]> {
+  return selectRows("SELECT * FROM transactions ORDER BY posted_at DESC LIMIT ?", [limit]);
 }

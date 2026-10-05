@@ -10,16 +10,13 @@ const inr = (n: number) => "Rs." + n.toLocaleString("en-IN", { maximumFractionDi
 const bandClass: Record<string, string> = { LOW: "low", MEDIUM: "medium", HIGH: "high", CRITICAL: "critical" };
 const bandColor: Record<string, string> = { LOW: "#16803c", MEDIUM: "#b45309", HIGH: "#c2410c", CRITICAL: "#c0234a" };
 
-export default function Overview() {
-  const stats = caseStats();
-  const bands = bandSummary();
-  const feed = riskFeed(8);
-  const recent = recentTransactions(9);
-  const cases = listCases();
-  const counterparties = listCounterparties(6);
-  const lines = listCreditLines();
+export default async function Overview() {
+  const [stats, bands, feed, recent, cases, counterparties, lines, criticalTotal, highTotal] = await Promise.all([
+    caseStats(), bandSummary(), riskFeed(8), recentTransactions(9), listCases(),
+    listCounterparties(6), listCreditLines(), creditTotal("CRITICAL"), creditTotal("HIGH"),
+  ]);
   const watchlist = counterparties.filter((c) => c.watchlist === 1);
-  const critical = creditTotal("CRITICAL") + creditTotal("HIGH");
+  const critical = criticalTotal + highTotal;
 
   const bandMap = new Map(bands.map((b) => [b.band, b]));
   const totalCredits = bands.reduce((s, b) => s + (b.amount ?? 0), 0) || 1;

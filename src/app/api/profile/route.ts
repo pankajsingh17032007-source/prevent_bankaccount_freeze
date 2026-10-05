@@ -7,15 +7,13 @@ export const dynamic = "force-dynamic";
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 export async function GET() {
-  const merchant = getMerchant();
-  const cps = listCounterparties(80);
-  const credits = listTransactions({ limit: 2000 }).filter((t) => t.credit > 0);
+  const [merchant, cps, transactions, bands, cases, lines, statements, transactionCount] = await Promise.all([
+    getMerchant(), listCounterparties(80), listTransactions({ limit: 2000 }), bandSummary(),
+    listCases(), listCreditLines(), listStatements(), countTransactions(),
+  ]);
+  const credits = transactions.filter((t) => t.credit > 0);
   const totalAmt = credits.reduce((s, t) => s + t.credit, 0);
   const reconciledAmt = credits.filter((t) => t.reconciled === 1).reduce((s, t) => s + t.credit, 0);
-  const bands = bandSummary();
-  const cases = listCases();
-  const lines = listCreditLines();
-  const statements = listStatements();
   const verified = cps.filter((c) => c.kyc_status === "verified").length;
   const watchlisted = cps.filter((c) => c.watchlist === 1).length;
   const months = Math.max(1, Math.round(statements.reduce((s, x) => s + x.txn_count, 0) / 250));
@@ -55,7 +53,7 @@ export async function GET() {
 <div class="grid">
  <div class="tile"><div class="k">Inbound reconciled</div><div class="v">${pct}%</div><div class="small muted">${inr(reconciledAmt)} of ${inr(totalAmt)}</div></div>
  <div class="tile"><div class="k">Counterparties verified</div><div class="v">${verified}/${cps.length}</div><div class="small muted">GSTIN / PAN checked</div></div>
- <div class="tile"><div class="k">Transactions covered</div><div class="v">${countTransactions()}</div><div class="small muted">${statements.length} statements</div></div>
+ <div class="tile"><div class="k">Transactions covered</div><div class="v">${transactionCount}</div><div class="small muted">${statements.length} statements</div></div>
  <div class="tile"><div class="k">Watchlisted payers</div><div class="v">${watchlisted}</div><div class="small muted">disclosed, not concealed</div></div>
 </div>
 <h2>Account architecture</h2>

@@ -17,10 +17,10 @@ export default async function StatementsPage({
   const sp = await searchParams;
   const band = (sp.band ?? "ALL").toUpperCase();
   const q = sp.q ?? "";
-  const statements = listStatements();
-  const rows = listTransactions({ band, q, limit: 120 });
-  const counts = new Map(bandSummary().map((b) => [b.band, b.n]));
-  const total = countTransactions();
+  const [statements, rows, summary, total] = await Promise.all([
+    listStatements(), listTransactions({ band, q, limit: 120 }), bandSummary(), countTransactions(),
+  ]);
+  const counts = new Map(summary.map((b) => [b.band, b.n]));
 
   return (
     <div className="stack">
@@ -63,7 +63,7 @@ export default async function StatementsPage({
             </div>
             <button type="submit" className="block">Parse and score inbound payments</button>
             <p className="tiny muted">
-              The file stays on this machine - parsing happens in the request. Works with the usual Indian bank CSV
+              The file is parsed on the server and the resulting ledger is stored in Turso. Works with the usual Indian bank CSV
               exports (dd/mm/yyyy dates, UPI/IMPS/NEFT narrations). Time of day is used for the after-midnight rule
               when the export carries it; otherwise midday is assumed.
             </p>

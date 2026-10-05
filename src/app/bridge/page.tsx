@@ -15,10 +15,8 @@ const STATUS_OPTS = [
 const PAYROLL = 310000;
 const VENDOR_WEEK = 260000;
 
-export default function BridgePage() {
-  const lines = listCreditLines();
-  const stats = caseStats();
-  const cases = listCases();
+export default async function BridgePage() {
+  const [lines, stats, cases] = await Promise.all([listCreditLines(), caseStats(), listCases()]);
   const held = stats.amountHeld;
 
   const available = lines.filter((l) => l.status === "available" || l.status === "approved");

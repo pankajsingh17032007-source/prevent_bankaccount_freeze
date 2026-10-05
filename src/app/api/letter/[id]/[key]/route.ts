@@ -7,11 +7,10 @@ export const dynamic = "force-dynamic";
 
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string; key: string }> }) {
   const { id, key } = await ctx.params;
-  const c = getCase(Number(id));
+  const c = await getCase(Number(id));
   if (!c) return new Response("Case not found", { status: 404 });
 
-  const merchant = getMerchant();
-  const pack = buildEvidencePack(c);
+  const [merchant, pack] = await Promise.all([getMerchant(), buildEvidencePack(c)]);
   const today = localDate();
   const letter = getLetter(key, { merchant, c, traceable: pack.traceable, excess: pack.excess, generatedOn: today });
 

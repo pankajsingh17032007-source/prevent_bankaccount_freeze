@@ -25,8 +25,9 @@ export interface EvidencePack {
 const inr = (n: number) => "Rs." + n.toLocaleString("en-IN", { maximumFractionDigits: 0 });
 const dayMs = 86400_000;
 
-export function buildEvidencePack(c: FreezeCase): EvidencePack {
-  const merchant = getMerchant();
+export async function buildEvidencePack(c: FreezeCase): Promise<EvidencePack> {
+  const merchant = await getMerchant();
+  const database = await db();
   const generatedOn = localDate();
   const held = c.hold_amount;
   const traceable = c.disputed_amount;
@@ -34,31 +35,30 @@ export function buildEvidencePack(c: FreezeCase): EvidencePack {
 
   const freezeTs = new Date(c.freeze_date).getTime();
   const windowStart = localStamp(new Date(freezeTs - 30 * dayMs));
-  const trail = db()
-    .prepare(
+  const trailResult = await database.execute(
       `SELECT * FROM transactions
        WHERE credit > 0 AND posted_at >= ? AND posted_at <= datetime(?, '+1 day')
        ORDER BY credit DESC`,
-    )
-    .all(windowStart, c.freeze_date) as Transaction[];
+      [windowStart, c.freeze_date],
+    );
+  const trail = trailResult.rows as unknown as Transaction[];
 
   const risky = trail.filter((t) => t.risk_band === "HIGH" || t.risk_band === "CRITICAL" || t.reconciled === 0);
   const clean = trail.filter((t) => t.risk_band === "LOW" && t.reconciled === 1);
 
-  const orders = db()
-    .prepare(
+  const ordersResult = await database.execute(
       `SELECT order_no, buyer, amount, placed_at, invoice_no, ship_status, awb
        FROM orders WHERE placed_at >= ? ORDER BY placed_at DESC LIMIT 60`,
-    )
-    .all(windowStart) as Array<{
+      [windowStart],
+    );
+  const orders = ordersResult.rows as unknown as Array<{
     order_no: string; buyer: string; amount: number; placed_at: string;
     invoice_no: string | null; ship_status: string; awb: string | null;
   }>;
 
   const matchedSum = clean.reduce((s, t) => s + t.credit, 0);
   const riskSum = risky.reduce((s, t) => s + t.credit, 0);
-  const docs = listDocuments(c.id);
-  const stages = listStages(c.id);
+  const [docs, stages] = await Promise.all([listDocuments(c.id), listStages(c.id)]);
 
   const sections: PackSection[] = [
     {

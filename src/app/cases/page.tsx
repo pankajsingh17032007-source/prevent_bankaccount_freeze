@@ -7,10 +7,9 @@ import { inr, fmtDate } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-export default function CasesPage() {
-  const cases = listCases();
-  const stats = caseStats();
-  const merchant = getMerchant();
+export default async function CasesPage() {
+  const [cases, stats, merchant] = await Promise.all([listCases(), caseStats(), getMerchant()]);
+  const stagesByCase = new Map(await Promise.all(cases.map(async (c) => [c.id, await listStages(c.id)] as const)));
 
   return (
     <div className="stack">
@@ -34,7 +33,7 @@ export default function CasesPage() {
       <div className="grid g-21">
         <div className="stack">
           {cases.map((c) => {
-            const stages = listStages(c.id);
+            const stages = stagesByCase.get(c.id) ?? [];
             const next = stages.find((s) => s.status !== "done" && s.status !== "skipped");
             const done = stages.filter((s) => s.status === "done").length;
             return (

@@ -30,13 +30,12 @@ const DOC_GROUPS: Array<[string, string]> = [
 
 export default async function CaseDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const c = getCase(Number(id));
+  const c = await getCase(Number(id));
   if (!c) notFound();
 
-  const merchant = getMerchant();
-  const stages = listStages(c.id);
-  const docs = listDocuments(c.id);
-  const pack = buildEvidencePack(c);
+  const [merchant, stages, docs, pack] = await Promise.all([
+    getMerchant(), listStages(c.id), listDocuments(c.id), buildEvidencePack(c),
+  ]);
   const letters = lettersFor(c, merchant, pack.traceable, pack.excess, pack.generatedOn);
   const active = stages.find((s) => s.status !== "done" && s.status !== "skipped") ?? stages[stages.length - 1];
   const heldPct = Math.min(100, (c.disputed_amount / Math.max(1, c.hold_amount)) * 100);

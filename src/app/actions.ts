@@ -22,7 +22,7 @@ export async function uploadStatement(formData: FormData): Promise<void> {
     redirect("/statements?err=" + encodeURIComponent("Choose a CSV statement first."));
   }
   const text = await file.text();
-  const res = ingestStatement(text, file.name, bank, account);
+  const res = await ingestStatement(text, file.name, bank, account);
   refresh();
   const q = new URLSearchParams({
     ok: "1",
@@ -40,12 +40,12 @@ export async function setStageStatus(caseId: number, stageId: number, status: st
   const allowed = ["not_started", "in_progress", "awaiting_response", "escalated", "done", "skipped"];
   if (!allowed.includes(status)) return;
   const stamp = localStamp();
-  db()
-    .prepare(
-      `UPDATE case_stages SET status=?, actioned_at=CASE WHEN ?='done' THEN ? ELSE actioned_at END,
-       log=? WHERE id=? AND case_id=?`,
-    )
-    .run(status, status, stamp, `Marked ${status} on ${stamp}.`, stageId, caseId);
+  const database = await db();
+  await database.execute(
+    `UPDATE case_stages SET status=?, actioned_at=CASE WHEN ?='done' THEN ? ELSE actioned_at END,
+     log=? WHERE id=? AND case_id=?`,
+    [status, status, stamp, `Marked ${status} on ${stamp}.`, stageId, caseId],
+  );
   refresh(["/cases", `/cases/${caseId}`]);
 }
 
@@ -64,7 +64,7 @@ export async function setCaseStatus(caseId: number, status: string): Promise<voi
     "released", "partial_release", "closed",
   ];
   if (!allowed.includes(status)) return;
-  db().prepare("UPDATE cases SET status=? WHERE id=?").run(status, caseId);
+  await (await db()).execute("UPDATE cases SET status=? WHERE id=?", [status, caseId]);
   refresh(["/cases", `/cases/${caseId}`]);
 }
 
@@ -73,28 +73,29 @@ export async function createCase(formData: FormData): Promise<void> {
   const num = (k: string) => Number(String(formData.get(k) ?? "0").replace(/[, ]/g, "")) || 0;
   const title = str("title");
   if (!title) return;
-  const merchant = getMerchant();
+  const merchant = await getMerchant();
   const freezeDate = str("freeze_date") || localDate();
-  const n = (db().prepare("SELECT COUNT(*) c FROM cases").get() as { c: number }).c + 1;
+  const database = await db();
+  const count = await database.execute("SELECT COUNT(*) c FROM cases");
+  const n = Number(count.rows[0]?.c ?? 0) + 1;
   const caseRef = `AF-${new Date().getFullYear()}-${String(140 + n).padStart(4, "0")}`;
   const hold = num("hold_amount");
   const disputed = num("disputed_amount");
-  const res = db()
-    .prepare(
+  const res = await database.execute(
       `INSERT INTO cases (case_ref, title, account_no, bank, branch, hold_amount, disputed_amount,
         account_balance, hold_scope, trigger_source, ncrp_complaint, fir_no, police_station,
         freeze_date, status, created_at, notes)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    )
-    .run(
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+      [
       caseRef, title, str("account_no") || merchant.collection_account, str("bank") || merchant.collection_bank,
       str("branch") || merchant.collection_branch, hold, disputed, num("account_balance") || hold,
       formData.get("hold_scope") === "disputed_amount" ? "disputed_amount" : "full_balance",
       str("trigger_source") || "NCRP/I4C cyber-fraud portal complaint",
       str("ncrp_complaint") || null, str("fir_no") || null, str("police_station"),
       freezeDate, "open", localDate(), str("notes"),
+      ],
     );
-  const caseId = Number(res.lastInsertRowid);
+  const caseId = Number(res.rows[0]?.id);
   refresh(["/cases"]);
   redirect(`/cases/${caseId}`);
 }
@@ -102,29 +103,28 @@ export async function createCase(formData: FormData): Promise<void> {
 /* ---------------- documents & counterparties ---------------- */
 
 export async function toggleDocument(caseId: number, docId: number): Promise<void> {
-  db().prepare("UPDATE documents SET present = CASE WHEN present=1 THEN 0 ELSE 1 END WHERE id=? AND case_id=?")
-    .run(docId, caseId);
+  await (await db()).execute("UPDATE documents SET present = CASE WHEN present=1 THEN 0 ELSE 1 END WHERE id=? AND case_id=?", [docId, caseId]);
   refresh([`/cases/${caseId}`, "/cases"]);
 }
 
 export async function setKyc(cpId: number, status: string): Promise<void> {
   if (!["verified", "pending", "unverified", "expired"].includes(status)) return;
-  db().prepare("UPDATE counterparties SET kyc_status=? WHERE id=?").run(status, cpId);
+  await (await db()).execute("UPDATE counterparties SET kyc_status=? WHERE id=?", [status, cpId]);
   refresh(["/prevention", "/risk", "/profile"]);
 }
 
 export async function toggleWatchlist(cpId: number): Promise<void> {
-  db().prepare("UPDATE counterparties SET watchlist = CASE WHEN watchlist=1 THEN 0 ELSE 1 END WHERE id=?").run(cpId);
+  await (await db()).execute("UPDATE counterparties SET watchlist = CASE WHEN watchlist=1 THEN 0 ELSE 1 END WHERE id=?", [cpId]);
   refresh(["/prevention", "/risk"]);
 }
 
 export async function setCreditLine(id: number, status: string): Promise<void> {
   if (!["available", "applied", "approved", "drawn"].includes(status)) return;
-  db().prepare("UPDATE credit_lines SET status=? WHERE id=?").run(status, id);
+  await (await db()).execute("UPDATE credit_lines SET status=? WHERE id=?", [status, id]);
   refresh(["/bridge"]);
 }
 
 export async function setCounterpartyNote(cpId: number, note: string): Promise<void> {
-  db().prepare("UPDATE counterparties SET note=? WHERE id=?").run(String(note).slice(0, 400), cpId);
+  await (await db()).execute("UPDATE counterparties SET note=? WHERE id=?", [String(note).slice(0, 400), cpId]);
   refresh(["/prevention"]);
 }

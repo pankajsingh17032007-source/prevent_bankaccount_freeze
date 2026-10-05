@@ -22,26 +22,24 @@ export interface IngestResult {
   issues: string[];
 }
 
-export function ingestStatement(text: string, filename: string, bank: string, account: string): IngestResult {
+export async function ingestStatement(text: string, filename: string, bank: string, account: string): Promise<IngestResult> {
   const parsed = parseStatement(text);
-  const d = db();
-  const sid = Number(
-    d.prepare("INSERT INTO statements(filename, bank, account_no, uploaded_at, txn_count) VALUES(?,?,?,?,0)")
-      .run(filename, bank, account, localStamp()).lastInsertRowid,
-  );
+  const d = await db();
+  const tx = await d.transaction("write");
+  try {
+    const statement = await tx.execute({
+      sql: "INSERT INTO statements(filename, bank, account_no, uploaded_at, txn_count) VALUES(?,?,?,?,0) RETURNING id",
+      args: [filename, bank, account, localStamp()],
+    });
+    const sid = Number(statement.rows[0]?.id);
 
-  // Reconcile credits to existing orders by amount + date.
-  const orders = d.prepare("SELECT id, amount, placed_at FROM orders WHERE id NOT IN (SELECT order_id FROM transactions WHERE order_id IS NOT NULL)").all() as Array<{
-    id: number; amount: number; placed_at: string;
-  }>;
+    // Reconcile credits to existing orders by amount + date.
+    const orderResult = await tx.execute("SELECT id, amount, placed_at FROM orders WHERE id NOT IN (SELECT order_id FROM transactions WHERE order_id IS NOT NULL)");
+    const orders = orderResult.rows as unknown as Array<{ id: number; amount: number; placed_at: string }>;
   const orderByKey = new Map<string, number>();
   for (const o of orders) orderByKey.set(`${o.amount}|${o.placed_at.slice(0, 10)}`, o.id);
   const used = new Set<number>();
 
-  const insert = d.prepare(`
-    INSERT INTO transactions (statement_id, posted_at, narration, payer, ref_no, credit, debit, balance, order_id, risk_score, risk_band, risk_reasons, reconciled)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
   const txns: Array<ParsedRow & { order_id: number | null; reconciled: number }> = [];
 
   for (const r of parsed.rows) {
@@ -56,10 +54,11 @@ export function ingestStatement(text: string, filename: string, bank: string, ac
 
   // Score in chronological order: "first ever credit from this payer" is only
   // accurate if the ledger is walked in the order money actually arrived.
-  const ctx = buildContext(txns, d);
+  const ctx = await buildContext(txns, tx);
   const blobs = ctx as ScoreContext & Partial<ScoreBlobs>;
   const flagged: number[] = [];
 
+  const inserts = [];
   for (const t of txns) {
     const input: TxnInput = {
       posted_at: t.posted_at, payer: t.payer, narration: t.narration,
@@ -71,22 +70,33 @@ export function ingestStatement(text: string, filename: string, bank: string, ac
     const res = scoreTransaction(input, ctx);
     ctx.knownPayers.add(t.payer.toUpperCase());
     if (res.score >= 50) flagged.push(res.score);
-    insert.run(
-      sid, t.posted_at, t.narration, t.payer, t.ref_no, t.credit, t.debit, t.balance,
-      t.order_id, res.score, res.band, JSON.stringify(res.reasons), t.reconciled,
-    );
+    inserts.push({
+      sql: `INSERT INTO transactions
+        (statement_id, posted_at, narration, payer, ref_no, credit, debit, balance, order_id, risk_score, risk_band, risk_reasons, reconciled)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [sid, t.posted_at, t.narration, t.payer, t.ref_no, t.credit, t.debit, t.balance,
+        t.order_id, res.score, res.band, JSON.stringify(res.reasons), t.reconciled],
+    });
   }
 
-  d.prepare("UPDATE statements SET txn_count=? WHERE id=?").run(txns.length, sid);
-  refreshCounterparties(d);
+    if (inserts.length) await tx.batch(inserts);
+    await tx.execute({ sql: "UPDATE statements SET txn_count=? WHERE id=?", args: [txns.length, sid] });
+    await refreshCounterparties(tx);
+    await tx.commit();
 
-  return {
-    statementId: sid,
-    inserted: txns.length,
-    flagged: flagged.length,
-    highestBand: flagged.some((s) => s >= 75) ? "CRITICAL" : flagged.length ? "HIGH" : "LOW",
-    issues: parsed.issues,
-  };
+    return {
+      statementId: sid,
+      inserted: txns.length,
+      flagged: flagged.length,
+      highestBand: flagged.some((s) => s >= 75) ? "CRITICAL" : flagged.length ? "HIGH" : "LOW",
+      issues: parsed.issues,
+    };
+  } catch (error) {
+    await tx.rollback();
+    throw error;
+  } finally {
+    tx.close();
+  }
 }
 
 interface ScoreBlobs {
@@ -99,39 +109,33 @@ interface ScoreBlobs {
  * totals honest when a statement is re-uploaded, while preserving the KYC and
  * watchlist judgements a human already made.
  */
-function refreshCounterparties(d: import("better-sqlite3").Database): void {
-  const agg = d
-    .prepare(
-      `SELECT upper(trim(payer)) name, min(posted_at) first_seen, max(posted_at) last_seen,
-              sum(credit) total, count(*) n
-       FROM transactions WHERE credit > 0 AND trim(payer) <> ''
-       GROUP BY upper(trim(payer))`,
-    )
-    .all() as Array<{ name: string; first_seen: string; last_seen: string; total: number; n: number }>;
-
-  const upsert = d.prepare(`
-    INSERT INTO counterparties (name, kind, gstin, kyc_status, first_seen, last_seen, credits_total, credit_count, note, watchlist)
-    VALUES (@name, 'customer', NULL, 'unverified', @first_seen, @last_seen, @total, @n, '', 0)
-    ON CONFLICT(name) DO UPDATE SET
-      first_seen = MIN(counterparties.first_seen, excluded.first_seen),
-      last_seen  = MAX(counterparties.last_seen, excluded.last_seen),
-      credits_total = excluded.credits_total,
-      credit_count  = excluded.credit_count
-  `);
-  const tx = d.transaction(() => {
-    for (const a of agg) upsert.run({ ...a, total: Math.round(a.total) });
-  });
-  tx();
+async function refreshCounterparties(d: import("@libsql/client").Client | import("@libsql/client").Transaction): Promise<void> {
+  const result = await d.execute(
+    `SELECT upper(trim(payer)) name, min(posted_at) first_seen, max(posted_at) last_seen,
+            sum(credit) total, count(*) n
+     FROM transactions WHERE credit > 0 AND trim(payer) <> ''
+     GROUP BY upper(trim(payer))`,
+  );
+  const agg = result.rows as unknown as Array<{ name: string; first_seen: string; last_seen: string; total: number; n: number }>;
+  if (agg.length) await d.batch(agg.map((a) => ({
+    sql: `INSERT INTO counterparties (name, kind, gstin, kyc_status, first_seen, last_seen, credits_total, credit_count, note, watchlist)
+      VALUES (?, 'customer', NULL, 'unverified', ?, ?, ?, ?, '', 0)
+      ON CONFLICT(name) DO UPDATE SET
+        first_seen = MIN(counterparties.first_seen, excluded.first_seen),
+        last_seen = MAX(counterparties.last_seen, excluded.last_seen),
+        credits_total = excluded.credits_total, credit_count = excluded.credit_count`,
+    args: [a.name, a.first_seen, a.last_seen, Math.round(a.total), a.n],
+  })));
 }
 
 /**
  * Assemble the aggregates the scorer needs: same-day clusters, per-payer history,
  * known payers and the watchlist of accounts already frozen upstream.
  */
-function buildContext(
+async function buildContext(
   txns: Array<ParsedRow & { order_id: number | null }>,
-  d: import("better-sqlite3").Database,
-): ScoreContext {
+  d: import("@libsql/client").Client | import("@libsql/client").Transaction,
+): Promise<ScoreContext> {
   const ctx: ScoreContext & Partial<ScoreBlobs> = {
     knownPayers: new Set<string>(),
     dayCluster: { amounts: new Map(), payers: new Set() },
@@ -142,16 +146,12 @@ function buildContext(
     history: new Map(),
   };
 
-  try {
-    const rows = d.prepare("SELECT name FROM counterparties WHERE watchlist=1").all() as Array<{ name: string }>;
-    for (const r of rows) ctx.watchlist.add(r.name.toUpperCase());
-    // Payers seen in earlier statements are not "first-ever" credits, so the
-    // new-payer rule only fires for genuinely unknown accounts.
-    const known = d.prepare("SELECT name FROM counterparties").all() as Array<{ name: string }>;
-    for (const r of known) ctx.knownPayers.add(r.name.toUpperCase());
-  } catch {
-    /* first run: no register yet */
-  }
+  const watchlistRows = await d.execute("SELECT name FROM counterparties WHERE watchlist=1");
+  for (const r of watchlistRows.rows as unknown as Array<{ name: string }>) ctx.watchlist.add(r.name.toUpperCase());
+  // Payers seen in earlier statements are not "first-ever" credits, so the
+  // new-payer rule only fires for genuinely unknown accounts.
+  const knownRows = await d.execute("SELECT name FROM counterparties");
+  for (const r of knownRows.rows as unknown as Array<{ name: string }>) ctx.knownPayers.add(r.name.toUpperCase());
 
   const clusters = ctx.clusters!;
   for (const t of txns) {
